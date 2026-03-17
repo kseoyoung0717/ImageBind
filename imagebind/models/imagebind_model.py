@@ -6,6 +6,8 @@
 # LICENSE file in the root directory of this source tree.
 
 
+
+
 import os
 from functools import partial
 from types import SimpleNamespace
@@ -35,23 +37,23 @@ ModalityType = SimpleNamespace(
 
 
 class ImageBindModel(nn.Module):
-    def __init__(
+    def __init__( #input -> preprocessing -> transformer -> projection -> normalize 
         self,
         video_frames=2,
         kernel_size=(2, 14, 14),
         audio_kernel_size=16,
         audio_stride=10,
-        out_embed_dim=768,
+        out_embed_dim=768, #vision token dimension   
         vision_embed_dim=1024,
-        vision_num_blocks=24,
-        vision_num_heads=16,
-        audio_embed_dim=768,
+        vision_num_blocks=24, #num_blocks=> transformer layer 수 
+        vision_num_heads=16, #num_heads=> attention head 수 
+        audio_embed_dim=768, #audio token dimension 
         audio_num_blocks=12,
         audio_num_heads=12,
         audio_num_mel_bins=128,
         audio_target_len=204,
         audio_drop_path=0.1,
-        text_embed_dim=768,
+        text_embed_dim=768, #text token dimension 
         text_num_blocks=12,
         text_num_heads=12,
         depth_embed_dim=384,
@@ -73,6 +75,7 @@ class ImageBindModel(nn.Module):
         super().__init__()
 
         self.modality_preprocessors = self._create_modality_preprocessors(
+            #모달리티별 입력 데이터를 token으로 변환하는 부분 
             video_frames,
             vision_embed_dim,
             kernel_size,
@@ -90,6 +93,7 @@ class ImageBindModel(nn.Module):
         )
 
         self.modality_trunks = self._create_modality_trunks(
+            #모달리티마다 다른 transformer encoder를 하나씩 만들어서 저장 
             vision_embed_dim,
             vision_num_blocks,
             vision_num_heads,
@@ -115,20 +119,23 @@ class ImageBindModel(nn.Module):
         )
 
         self.modality_heads = self._create_modality_heads(
-            out_embed_dim,
-            vision_embed_dim,
-            text_embed_dim,
-            audio_embed_dim,
-            depth_embed_dim,
-            thermal_embed_dim,
-            imu_embed_dim,
+            #각 모달리티의 head 레이어들을 생성, 즉 transformer가 만든 feature를 최종 embedding dimension으로 projection하는 부분  
+            #필요 이유:각 modality transformer의 출력 dimension이 다른데 모델의 최종목표는 모든 modality를 같은 embedding dimension으로 통일하는 것이므로 
+            out_embed_dim, #최종 embedding dimension
+            vision_embed_dim,#vision transformer 출력 dimension 
+            text_embed_dim, #text transformer 출력 dimension
+            audio_embed_dim, #audio transformer 출력 dimension
+            depth_embed_dim, #depth transformer 출력 dimension
+            thermal_embed_dim, #thermal transformer 출력 dimension
+            imu_embed_dim, #imu transformer 출력 dimension
         )
 
         self.modality_postprocessors = self._create_modality_postprocessors(
             out_embed_dim
-        )
+        )#embedding dimension을 normalize하는 부분 
 
     def _create_modality_preprocessors(
+        #각 모달리티 입력을 transformer가 처리할 수 있는 token 형태로 변환하는 preprocessor 모듈들을 생성하기 위함
         self,
         video_frames=2,
         vision_embed_dim=1024,
@@ -145,49 +152,55 @@ class ImageBindModel(nn.Module):
         thermal_kernel_size=16,
         imu_embed_dim=512,
     ):
-        rgbt_stem = PatchEmbedGeneric(
-            proj_stem=[
-                PadIm2Video(pad_type="repeat", ntimes=2),
-                nn.Conv3d(
+        rgbt_stem = PatchEmbedGeneric( #vison 입력을 patch token으로 변환하는 stem 모듈을 생성 
+            proj_stem=[ #실행순서: PamIm2Video => Conv3d => patch embedding 
+                PadIm2Video(pad_type="repeat", ntimes=2), #이미지를 비디오 형태로 변환: 입력형태를 [C, H, W]=> [C, T, H, W]형태로 만들어야함 
+                #ntimes=2: 같은 이미지를 2frame으로 반복 
+                nn.Conv3d( #patch embedding 역할을 함 
                     in_channels=3,
                     kernel_size=kernel_size,
                     out_channels=vision_embed_dim,
-                    stride=kernel_size,
+                    stride=kernel_size, #patch단위로 입력을 쪼갬 
                     bias=False,
                 ),
             ]
         )
-        rgbt_preprocessor = RGBDTPreprocessor(
-            img_size=[3, video_frames, 224, 224],
-            num_cls_tokens=1,
-            pos_embed_fn=partial(SpatioTemporalPosEmbeddingHelper, learnable=True),
+        rgbt_preprocessor = RGBDTPreprocessor( #vision 모달리티 전체 preprocessing 모듈을 생성(stem + cls token + positional embedding)
+            img_size=[3, video_frames, 224, 224], #입력 shape: [C, T, H, W]
+            num_cls_tokens=1, #transformer에서 사용하는 cls token 개수 
+            pos_embed_fn=partial(SpatioTemporalPosEmbeddingHelper, learnable=True), #position embedding 생성 함수
+            #vision token은 time + height + width ->위치 정보를 가지므로 spatiotemporal positional embedding을 사용함 
+            #learnable=True: position embedding이 학습가능하도록 설정 
             rgbt_stem=rgbt_stem,
-            depth_stem=None,
+            depth_stem=None, #이 preprocessor에서는 depth 입력을 사용하지 않음 => none 
         )
 
-        text_preprocessor = TextPreprocessor(
-            context_length=77,
-            vocab_size=49408,
-            embed_dim=text_embed_dim,
-            causal_masking=True,
+        text_preprocessor = TextPreprocessor( #텍스트 입력을 transformer 에 넣을 수 있는 token embedding으로 변환하는 전처리 모듈 생성 
+            context_length=77, #텍스트 최대 토큰 길이 => 한 문장은 최대 77token까지만 사용됨 
+            vocab_size=49408, #사용하는 vocabulary 크기 => tokenizer 가 사용하는 단어(토큰)개수 
+            embed_dim=text_embed_dim, #각 토큰을 변환할 embedding vector dimension 
+            causal_masking=True, #transformer attention 에서 causal mask를 사용한다는 의미, 즉 attention이 현재 토큰->이전 토큰만 볼 수 있음을 의미 
         )
 
-        audio_stem = PatchEmbedGeneric(
+        audio_stem = PatchEmbedGeneric( #오디오 입력을 patch token으로 변환하는 stem 모듈을 생성 
+                                       #오디오는 보통 mel spectrogram 형태로 입력됨 => [1, mel_bins, audio_target_len] 형태
             proj_stem=[
-                nn.Conv2d(
+                nn.Conv2d( #audio spectrogram을 patch 단위로 나누고 embedding변환 
                     in_channels=1,
                     kernel_size=audio_kernel_size,
                     stride=audio_stride,
-                    out_channels=audio_embed_dim,
+                    out_channels=audio_embed_dim, #각 patch가 audio_embed_dim 차원의 벡터가 됨 
                     bias=False,
                 ),
             ],
-            norm_layer=nn.LayerNorm(normalized_shape=audio_embed_dim),
+            norm_layer=nn.LayerNorm(normalized_shape=audio_embed_dim), #patch embedding이후에 LayerNorm을 적용함 
         )
-        audio_preprocessor = AudioPreprocessor(
-            img_size=[1, audio_num_mel_bins, audio_target_len],
-            num_cls_tokens=1,
-            pos_embed_fn=partial(SpatioTemporalPosEmbeddingHelper, learnable=True),
+        audio_preprocessor = AudioPreprocessor( #audio 전체 preprocessing 모듈을 생성함 
+            img_size=[1, audio_num_mel_bins, audio_target_len], #오디오 입력 데이터 형태 => [channels, mel_bins, time_steps]
+            num_cls_tokens=1, #transformer에서 사용하는 cls token 개수 => cls+audio patch token형태로 들어감 
+            pos_embed_fn=partial(SpatioTemporalPosEmbeddingHelper, learnable=True), #patch token에 position embedding을 추가하는 함수 
+            #audio spectrogram은 frequency + time-> 위치정보를 가지므로 positional embedding 필요 
+            #learnable=True: position embedding이 학습가능하도록 설정 
             audio_stem=audio_stem,
         )
 
