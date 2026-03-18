@@ -118,76 +118,83 @@ def _get_pos_embedding(
     return pos_embed
 
 
-class PatchEmbedGeneric(nn.Module):
+class PatchEmbedGeneric(nn.Module): #이미지를 잘게 patch로 쪼개고 transformer가 받을 수 있는 토큰 시퀀스로 변환 
     """
     PatchEmbed from Hydra
     """
+    #Hydra 구조에서 가져온 patch embedding 방식 
 
     def __init__(self, proj_stem, norm_layer: Optional[nn.Module] = None):
+        #proj_stem: 이미지를 feature 변환 레이어들로 변환 
+        #norm_layer: optional normalization 
         super().__init__()
 
         if len(proj_stem) > 1:
-            self.proj = nn.Sequential(*proj_stem)
+            self.proj = nn.Sequential(*proj_stem) #여러 레이어면 하나로 묶음(conv => conv => conv..이런식)
         else:
             # Special case to be able to load pre-trained models that were
             # trained with a standard stem
-            self.proj = proj_stem[0]
+            self.proj = proj_stem[0] #레이어 하나면 그대로 사용 
+        #이렇게 하는 이유: pretrained 모델 호환성 때문 
         self.norm_layer = norm_layer
 
     def get_patch_layout(self, img_size):
-        with torch.no_grad():
+        #image size: [c, h, w] 또는 [c, t, h, w] 형태의 튜플
+        with torch.no_grad(): #계산만 하고 gradient 안씀 
             dummy_img = torch.zeros(
                 [
                     1,
                 ]
                 + img_size
-            )
-            dummy_out = self.proj(dummy_img)
-        embed_dim = dummy_out.shape[1]
-        patches_layout = tuple(dummy_out.shape[2:])
-        num_patches = np.prod(patches_layout)
+            ) #테스트용 입력: (1, ㅊ, h, w)
+            dummy_out = self.proj(dummy_img) #conv 등 적용됨 
+        embed_dim = dummy_out.shape[1] #채널 수= 임베딩 차원 
+        patches_layout = tuple(dummy_out.shape[2:]) #spatial 구조 
+        num_patches = np.prod(patches_layout) #전체 패치 수 
         return patches_layout, num_patches, embed_dim
 
-    def forward(self, x):
-        x = self.proj(x)
+    def forward(self, x): #입력: x => (b, c, h, w) 또는 (b, c, t, h, w)
+        x = self.proj(x) #보통 conv layer, 또는 linear patch embedding 
         # B C (T) H W -> B (T)HW C
-        x = x.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2) #의미: (b, c, h, w) => (b, c, h*w) => (b, h*w, c) => transformer가 받을 수 있는 토큰 시퀀스 형태로 변환
         if self.norm_layer is not None:
             x = self.norm_layer(x)
         return x
 
 
-class SpatioTemporalPosEmbeddingHelper(VerboseNNModule):
+class SpatioTemporalPosEmbeddingHelper(VerboseNNModule): 
     def __init__(
         self,
         patches_layout: List,
-        num_patches: int,
-        num_cls_tokens: int,
-        embed_dim: int,
-        learnable: bool,
+        num_patches: int, #전체 patch 개수 
+        num_cls_tokens: int, #cls tocken 개수 
+        embed_dim: int, #embedding 차원 
+        learnable: bool, #positional embedding을 학습할지 여부 
     ) -> None:
         super().__init__()
-        self.num_cls_tokens = num_cls_tokens
-        self.patches_layout = patches_layout
-        self.num_patches = num_patches
-        self.num_tokens = num_cls_tokens + num_patches
-        self.learnable = learnable
+        self.num_cls_tokens = num_cls_tokens #cls 개수 저장 
+        self.patches_layout = patches_layout #patch 구조 저장 
+        self.num_patches = num_patches #patch 개수 
+        self.num_tokens = num_cls_tokens + num_patches #전체 토큰 수(cls + patch들)
+        self.learnable = learnable #학습여부 저장 
         if self.learnable:
             self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
-            trunc_normal_(self.pos_embed, std=0.02)
+            #shape가 (1, num_tockens, embed_dim) => 학습 가능한 파라미터 
+            trunc_normal_(self.pos_embed, std=0.02) #초기화(작은 랜덤값)
         else:
-            self.register_buffer(
+            self.register_buffer( #register_buffer: weight는 아니지만 모델에 저장됨, gradient 없음 
                 "pos_embed", get_sinusoid_encoding_table(self.num_tokens, embed_dim)
+                #sinusoidal positioning encoding => 학습 안함, 수학적으로 생성 
             )
 
-    def get_pos_embedding(self, vision_input, all_vision_tokens):
+    def get_pos_embedding(self, vision_input, all_vision_tokens): #입력: vision_input=> 원본 이미지, all_vision_tockens=> 토큰들(cls 포함)
         input_shape = vision_input.shape
-        pos_embed = _get_pos_embedding(
-            all_vision_tokens.size(1) - self.num_cls_tokens,
-            pos_embed=self.pos_embed,
-            patches_layout=self.patches_layout,
-            input_shape=input_shape,
-            first_patch_idx=self.num_cls_tokens,
+        pos_embed = _get_pos_embedding( #실제 계산 담당 함수 
+            all_vision_tokens.size(1) - self.num_cls_tokens, #patch 개수만 계산 
+            pos_embed=self.pos_embed, #앞에서 만든 임베딩 
+            patches_layout=self.patches_layout, #실제 입력 크기
+            input_shape=input_shape, 
+            first_patch_idx=self.num_cls_tokens, #cls 이후부터 patch 시작  
         )
         return pos_embed
 
@@ -420,26 +427,28 @@ class Im2Video(nn.Module):
             raise ValueError(f"Dimension incorrect {x.shape}")
 
 
-class PadIm2Video(Im2Video):
+class PadIm2Video(Im2Video): #이미지를 시간축(t)를 가진 데이터로 바꾼 뒤 부족한 프레임을 복제하거나 0으로 채워서 영상처럼 만드는 클래스
     def __init__(self, ntimes, pad_type, time_dim=2):
-        super().__init__(time_dim=time_dim)
-        assert ntimes > 0
-        assert pad_type in ["zero", "repeat"]
+        #ntimes: 최종 time 길이(프레임 수), pad_type: zero또는 repeat, time_dim: 시간 축 위치
+        super().__init__(time_dim=time_dim) #Im2Video=> 보통 (b, c, h, w)->(b, c, t=1, h, w)로 바꿔줌 
+        assert ntimes > 0 #프레임 수는 양수여야 함 
+        assert pad_type in ["zero", "repeat"] #pad 방식 제한 
         self.ntimes = ntimes
-        self.pad_type = pad_type
+        self.pad_type = pad_type #값 저장 
 
-    def forward(self, x):
-        x = super().forward(x)
-        if x.shape[self.time_dim] == 1:
+    def forward(self, x): #입력 x: 이미지 또는 영상 / 영상일때만 t 있음 
+        x = super().forward(x) #결과: 시간축 t=1 생성 
+        if x.shape[self.time_dim] == 1: #시간 길이 1이면 padding 수행 
             if self.pad_type == "repeat":
                 new_shape = [1] * len(x.shape)
-                new_shape[self.time_dim] = self.ntimes
+                new_shape[self.time_dim] = self.ntimes #시간축만 ntimes로 설정 
                 x = x.repeat(new_shape)
             elif self.pad_type == "zero":
-                padarg = [0, 0] * len(x.shape)
-                padarg[2 * self.time_dim + 1] = self.ntimes - x.shape[self.time_dim]
-                x = nn.functional.pad(x, padarg)
+                padarg = [0, 0] * len(x.shape) #padding인자 초기화 
+                padarg[2 * self.time_dim + 1] = self.ntimes - x.shape[self.time_dim] #시간축 뒤쪽에 Padding 추가 
+                x = nn.functional.pad(x, padarg) #zero padding 적용 
         return x
+    #imagebind는 image, video, audio 모두 처리하기에 입력형태 통일 필요 => 이미지를 가짜 비디오로 변환(멀티모달 입력형식 통일용)
 
 
 # Modified from github.com/openai/CLIP
