@@ -91,9 +91,13 @@ class Mlp(nn.Module):
         return x
 
 
-class MultiheadAttention(nn.MultiheadAttention):
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor):
+class MultiheadAttention(nn.MultiheadAttention): #기존 파이토치 클래스 상속 => 기존 기능 그대로 + forward 만 커스터마이즈 
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor): #x: 입력 토큰, attn_mask: attention 제한용 마스크
         return super().forward(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
+    #self_attention: 같은 입력끼리 비교 => query, key, value 모두 x로 설정
+    #need_weights=False: attention map 반환 안함 => 메모리 절약
+    #attn_mask=attn_mask: attention 제한용 마스크 전달 => 특정 토큰끼리만 attention 하도록 제한 가능
+    #반환값이 (attn_output, attn_weights) 형태이므로 [0]으로 attn_output만 반환
 
 
 class ViTAttention(Attention):
@@ -173,23 +177,24 @@ class BlockWithMasking(nn.Module):
 _LAYER_NORM = partial(nn.LayerNorm, eps=1e-6)
 
 
-class SimpleTransformer(nn.Module):
-    def __init__(
+class SimpleTransformer(nn.Module): #여러개의 transformer block을 쌓아서 encoder 만듦 
+    #input=> pre_transformer_layer(optional) => [block1, block2,...blockN] => post_taransformer_layer(optional)
+    def __init__( #attention 생성 함수 
         self,
         attn_target: Callable,
-        embed_dim: int,
-        num_blocks: int,
-        block: Callable = BlockWithMasking,
-        pre_transformer_layer: Optional[Callable] = None,
-        post_transformer_layer: Optional[Callable] = None,
+        embed_dim: int,#토큰 벡터 차원(D)
+        num_blocks: int, #transformer layer 개수 
+        block: Callable = BlockWithMasking, #한 층(block)의 구조 
+        pre_transformer_layer: Optional[Callable] = None, #transformer 앞에 붙는 레이어 
+        post_transformer_layer: Optional[Callable] = None,#transformer 뒤에 붙는 레이어 
         drop_path_rate: float = 0.0,
-        drop_path_type: str = "progressive",
-        norm_layer: Callable = _LAYER_NORM,
-        mlp_ratio: int = 4,
-        ffn_dropout_rate: float = 0.0,
+        drop_path_type: str = "progressive", #drop path 설정 
+        norm_layer: Callable = _LAYER_NORM, #normalization 종류 
+        mlp_ratio: int = 4, #ffn 크기 비율 
+        ffn_dropout_rate: float = 0.0, 
         layer_scale_type: Optional[str] = None,  # from cait; possible values are None, "per_channel", "scalar"
         layer_scale_init_value: float = 1e-4,  # from cait; float
-        weight_init_style: str = "jax",  # possible values jax or pytorch
+        weight_init_style: str = "jax",  # possible values jax or pytorch / weight 초기화 방식 
     ):
         """
         Simple Transformer with the following features
@@ -200,55 +205,58 @@ class SimpleTransformer(nn.Module):
         5. Makes few assumptions about the input except that it is a Tensor
         """
         super().__init__()
-        self.pre_transformer_layer = pre_transformer_layer
+        self.pre_transformer_layer = pre_transformer_layer #forward에서 먼저 실행됨 
         if drop_path_type == "progressive":
             dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_blocks)]
+            #block마다 drop_path 값 다르게 / 깊을수록 더 많이 drop 
         elif drop_path_type == "uniform":
-            dpr = [drop_path_rate for i in range(num_blocks)]
+            dpr = [drop_path_rate for i in range(num_blocks)] #모든 block 동일 
         else:
-            raise ValueError(f"Unknown drop_path_type: {drop_path_type}")
+            raise ValueError(f"Unknown drop_path_type: {drop_path_type}") #잘못된 값 방지  
 
-        self.blocks = nn.Sequential(
+        self.blocks = nn.Sequential( #여러 블록을 순서대로 실행 
             *[
                 block(
-                    dim=embed_dim,
-                    attn_target=attn_target,
-                    mlp_ratio=mlp_ratio,
+                    dim=embed_dim, #입력 차원 
+                    attn_target=attn_target, #attention 설정 전달 
+                    mlp_ratio=mlp_ratio, #ffn 크기 
                     ffn_dropout_rate=ffn_dropout_rate,
                     drop_path=dpr[i],
-                    norm_layer=norm_layer,
-                    layer_scale_type=layer_scale_type,
+                    norm_layer=norm_layer, #LayerNorm 설정 
+                    layer_scale_type=layer_scale_type, #LayerScale 설정
                     layer_scale_init_value=layer_scale_init_value,
                 )
-                for i in range(num_blocks)
+                for i in range(num_blocks) #num_blocks 개수만큼 반복 
             ]
         )
         self.post_transformer_layer = post_transformer_layer
-        self.weight_init_style = weight_init_style
-        self.apply(self._init_weights)
+        self.weight_init_style = weight_init_style #나중에 초기화 방식 선택 
+        self.apply(self._init_weights) #모든 서브모듈에 _init_weights 함수 적용 => weight 초기화
 
     def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
+        #m: 모델 안의 각 layer 
+        if isinstance(m, nn.Linear): #선형 레이어일때만 실행됨 
             if self.weight_init_style == "jax":
                 # Based on MAE and official Jax ViT implementation
+                #Xavier initialization: 입력/출력 분산 균형 맞춤 
                 torch.nn.init.xavier_uniform_(m.weight)
             elif self.weight_init_style == "pytorch":
                 # PyTorch ViT uses trunc_normal_
-                trunc_normal_(m.weight, std=0.02)
+                trunc_normal_(m.weight, std=0.02) #truncated noraml: 값 범위 제한된 정규분포, Pytorch ViT스타일 
 
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, (nn.LayerNorm)):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0) #bias는 0으로 초기화
+        elif isinstance(m, (nn.LayerNorm)): #layernorm일 경우 
+            nn.init.constant_(m.bias, 0) #bias=0
+            nn.init.constant_(m.weight, 1.0) #weight=1로 초기화 => 입력 그대로 유지하는 효과 
 
     def forward(
         self,
-        tokens: torch.Tensor,
-        attn_mask: torch.Tensor = None,
-        use_checkpoint: bool = False,
-        checkpoint_every_n: int = 1,
-        checkpoint_blk_ids: Optional[List[int]] = None,
+        tokens: torch.Tensor, #입력토큰
+        attn_mask: torch.Tensor = None, #attention제한용 마스크
+        use_checkpoint: bool = False, #메모리 절약 모드 
+        checkpoint_every_n: int = 1, #몇 개의 블록마다 checkpoint 쓸지
+        checkpoint_blk_ids: Optional[List[int]] = None, #특정 block만 checkpoint 
     ):
         """
         Inputs
@@ -259,22 +267,23 @@ class SimpleTransformer(nn.Module):
         - x: data of shape N x L x D (or L x N x D depending on the attention implementation)
         """
         if self.pre_transformer_layer:
-            tokens = self.pre_transformer_layer(tokens)
-        if use_checkpoint and checkpoint_blk_ids is None:
-            checkpoint_blk_ids = [
+            tokens = self.pre_transformer_layer(tokens) #(b, l, d) => (l, b, d) 또는 layernorm
+        if use_checkpoint and checkpoint_blk_ids is None: #checkpoint 사용하는데 특정 블록 지정 안했을 경우
+            checkpoint_blk_ids = [ #해당 블록들에 한해서만 checkpoint 사용
                 blk_id
                 for blk_id in range(len(self.blocks))
                 if blk_id % checkpoint_every_n == 0
             ]
         if checkpoint_blk_ids:
-            checkpoint_blk_ids = set(checkpoint_blk_ids)
-        for blk_id, blk in enumerate(self.blocks):
-            if use_checkpoint and blk_id in checkpoint_blk_ids:
+            checkpoint_blk_ids = set(checkpoint_blk_ids) #set으로 변환해서 빠른 탐색 가능하게
+        for blk_id, blk in enumerate(self.blocks): #transformer block 순회 => 각 블록마다 하나씩 실행 
+            if use_checkpoint and blk_id in checkpoint_blk_ids: #checkpoint 사용하는 경우 
+                #checkpoint: 메모리 절약 기술 => 원리: forward일때 중간값 저장 안하고 backward할때 다시 계산  
                 tokens = checkpoint.checkpoint(
                     blk, tokens, attn_mask, use_reentrant=False
                 )
             else:
-                tokens = blk(tokens, attn_mask=attn_mask)
+                tokens = blk(tokens, attn_mask=attn_mask) #그냥 일반 실행: 각 블록 안에서 attention => ffn => residual => norm 
         if self.post_transformer_layer:
-            tokens = self.post_transformer_layer(tokens)
+            tokens = self.post_transformer_layer(tokens) #(l, b, d) => (b, l, d) 또는 linear projection
         return tokens
